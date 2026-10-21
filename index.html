@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZenBox</title>
+  <meta name="description" content="Ve de un vistazo qué correos necesitan respuesta, cuáles leer y cuáles son ruido, junto a tu agenda. Todo ocurre en tu navegador.">
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <h1 id="appName">ZenBox</h1>
+        <div class="who" id="who"></div>
+      </div>
+      <div class="controls" id="controls" hidden>
+        <select id="days" aria-label="Periodo">
+          <option value="3">Últimos 3 días</option>
+          <option value="7" selected>Últimos 7 días</option>
+          <option value="14">Últimos 14 días</option>
+        </select>
+        <button id="refresh">Actualizar</button>
+        <button id="logout">Desconectar</button>
+      </div>
+    </header>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <section id="welcome" class="hero">
+      <h2>Tu correo, ordenado de un vistazo</h2>
+      <p>Conecta tu Gmail y tu Google Calendar y verás qué correos necesitan respuesta, cuáles conviene leer y cuáles son publicidad. Al lado, tu agenda de las próximas dos semanas.</p>
+      <ul>
+        <li>Solo lectura: la web nunca envía, borra ni mueve correos.</li>
+        <li>Todo se procesa en tu navegador. Tus correos no pasan por ningún servidor nuestro y no se guardan.</li>
+        <li>Puedes desconectarte cuando quieras.</li>
+      </ul>
+      <div class="actions">
+        <button class="primary" id="login">Conectar con Google</button>
+        <button id="demo">Ver demostración</button>
+      </div>
+      <p class="small" id="loginNote"></p>
+    </section>
+
+    <section id="app" hidden>
+      <div class="tiles" id="tiles"></div>
+      <div class="grid">
+        <div class="panel">
+          <h3 id="listTitle">Correos</h3>
+          <div id="list"></div>
+        </div>
+        <div class="side">
+          <div class="panel">
+            <h3>Agenda: próximos 14 días</h3>
+            <div id="agenda"></div>
+          </div>
+          <div class="panel senders">
+            <h3>Quién más ruido hace</h3>
+            <div id="senders"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <a href="privacidad.html">Política de privacidad</a>
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
