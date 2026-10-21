@@ -79,6 +79,7 @@
     }
     state.token = resp.access_token;
     state.demo = false;
+    state.subs = null;
     showApp();
     load();
   }
@@ -128,6 +129,24 @@
       api(G + "/threads/" + id + "?format=metadata" + headers)
     );
     return threads.map(toMail).filter(Boolean);
+  }
+
+  const RECEIPT_Q = 'newer_than:400d -category:promotions (recibo OR receipt OR factura OR invoice OR "tu suscripción" OR "your subscription" OR suscripción OR subscription OR renovación OR renewal OR membership OR "pago recibido" OR "payment received" OR "cobro")';
+
+  async function fetchReceipts() {
+    const G = "https://gmail.googleapis.com/gmail/v1/users/me";
+    const res = await api(G + "/messages?maxResults=150&q=" + encodeURIComponent(RECEIPT_Q));
+    const ids = (res.messages || []).map((m) => m.id);
+    const msgs = await mapLimit(ids, CONCURRENCY, (id) =>
+      api(G + "/messages/" + id + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject")
+    );
+    return msgs.map((m) => {
+      const hdr = (name) => {
+        const x = ((m.payload && m.payload.headers) || []).find((y) => y.name.toLowerCase() === name.toLowerCase());
+        return x ? x.value : "";
+      };
+      return { id: m.id, from: hdr("From"), subject: hdr("Subject"), snippet: decodeEntities(m.snippet), date: Number(m.internalDate) };
+    });
   }
 
   function toMail(t) {
@@ -194,6 +213,103 @@
   function senderEmail(from) {
     const m = /<([^>]+)>/.exec(from || "");
     return (m ? m[1] : from || "").toLowerCase().trim();
+  }
+
+  /* ---------- Suscripciones (a partir de recibos) ---------- */
+
+  const MONEY = /(R\$|US\$|\$|€|£)\s?(\d{1,4}(?:[.,]\d{2}))|(\d{1,4}(?:[.,]\d{2}))\s?(€|EUR|USD|BRL|GBP)/i;
+  const SUB_WORDS = /(suscripci[oó]n|subscription|membres[ií]a|membership|renovaci[oó]n|renewal|plan mensual|monthly plan)/i;
+  const SHARED_BILLERS = /(apple\.com|google\.com|paypal\.|stripe\.com)$/i;
+
+  function parseMoney(text) {
+    const m = MONEY.exec(text || "");
+    if (!m) return null;
+    let cur = (m[1] || m[4] || "").toUpperCase();
+    cur = { "EUR": "€", "USD": "$", "US$": "$", "BRL": "R$", "GBP": "£" }[cur] || cur;
+    const value = parseFloat((m[2] || m[3]).replace(",", "."));
+    return value > 0 ? { value, cur } : null;
+  }
+
+  function baseDomain(from) {
+    const d = senderEmail(from).split("@")[1] || "";
+    return d.split(".").slice(-2).join(".");
+  }
+
+  function frequency(days) {
+    if (days >= 6 && days <= 8) return { name: "Semanal", days: 7, perMonth: 30 / 7 };
+    if (days >= 25 && days <= 35) return { name: "Mensual", days: Math.round(days), perMonth: 1 };
+    if (days >= 80 && days <= 100) return { name: "Trimestral", days: Math.round(days), perMonth: 1 / 3 };
+    if (days >= 340 && days <= 390) return { name: "Anual", days: 365, perMonth: 1 / 12 };
+    return null;
+  }
+
+  function detectSubscriptions(receipts) {
+    const groups = new Map();
+    receipts.forEach((r) => {
+      r.money = parseMoney(r.subject + " " + r.snippet);
+      const dom = baseDomain(r.from);
+      // Apple, Google o PayPal cobran muchos servicios distintos: los separamos por importe.
+      const key = SHARED_BILLERS.test(dom) ? dom + "|" + (r.money ? r.money.cur + r.money.value : "?") : dom;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
+    });
+    const subs = [];
+    groups.forEach((list, key) => {
+      list.sort((a, b) => a.date - b.date);
+      const last = list[list.length - 1];
+      const priced = list.filter((r) => r.money);
+      const money = priced.length ? priced[priced.length - 1].money : null;
+      let freq = null;
+      if (list.length >= 2) {
+        const gaps = [];
+        for (let i = 1; i < list.length; i++) gaps.push((list[i].date - list[i - 1].date) / 864e5);
+        gaps.sort((a, b) => a - b);
+        freq = frequency(gaps[Math.floor(gaps.length / 2)]);
+      }
+      const isSub = list.some((r) => SUB_WORDS.test(r.subject + " " + r.snippet));
+      if (!freq && !isSub) return;
+      const old = Date.now() - last.date > (freq ? freq.days * 1.6 : 45) * 864e5;
+      if (old) return; // hace tiempo que no cobra: probablemente cancelada
+      let next = null;
+      if (freq) {
+        next = last.date + freq.days * 864e5;
+        while (next < Date.now() - 864e5) next += freq.days * 864e5;
+      }
+      const name = senderName(last.from);
+      subs.push({
+        name: SHARED_BILLERS.test(key.split("|")[0]) && money ? name + " (" + fmtMoney(money) + ")" : name,
+        money, freq, next, count: list.length, lastId: last.id,
+      });
+    });
+    return subs.sort((a, b) => (a.next || Infinity) - (b.next || Infinity));
+  }
+
+  function fmtMoney(m) {
+    const v = m.value.toLocaleString("es", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return m.cur === "€" ? v + " €" : m.cur + " " + v;
+  }
+
+  /* ---------- Promociones ---------- */
+
+  const PROMO_RULES = [
+    [/gratis|free|regalo|gift/i, 70],
+    [/2\s?x\s?1|3\s?x\s?2/i, 60],
+    [/evento|event|concierto|entradas/i, 50],
+    [/sorteo|giveaway|gana un|win a/i, 45],
+    [/descuento|discount|rebaja|sale\b|oferta/i, 30],
+    [/cup[oó]n|coupon|c[oó]digo promo|promo code/i, 25],
+    [/env[ií]o gratis|free shipping/i, 20],
+  ];
+
+  function promoScore(m) {
+    const text = m.subject + " " + m.snippet;
+    const hits = [];
+    PROMO_RULES.forEach(([re, pts]) => { if (re.test(text)) hits.push(pts); });
+    const pct = /(?:-|hasta\s|up to\s)?(\d{1,2})\s?%/i.exec(text);
+    if (pct) hits.push(Math.min(95, Number(pct[1])));
+    if (!hits.length) return 0;
+    hits.sort((a, b) => b - a);
+    return Math.min(100, hits[0] + 5 * (hits.length - 1));
   }
 
   /* ---------- Pantalla ---------- */
@@ -266,6 +382,75 @@
 
     renderAgenda();
     renderSenders();
+    renderSubs();
+    renderPromos();
+  }
+
+  function renderSubs() {
+    if (state.subsError) {
+      $("subs").replaceChildren(h("div", { class: "error" }, "No pude leer los recibos: " + state.subsError));
+      return;
+    }
+    const subs = state.subs || [];
+    if (!subs.length) {
+      $("subs").replaceChildren(h("div", { class: "empty" }, "No he encontrado recibos de suscripciones en tu correo."));
+      return;
+    }
+    const totals = {};
+    subs.forEach((s) => {
+      if (s.money && s.freq) totals[s.money.cur] = (totals[s.money.cur] || 0) + s.money.value * s.freq.perMonth;
+    });
+    const totalText = Object.entries(totals).map(([cur, v]) => fmtMoney({ cur, value: v })).join(" + ");
+    $("subs").replaceChildren(
+      totalText ? h("p", { class: "subtotal" }, "Gasto estimado al mes: ", h("strong", {}, totalText)) : null,
+      h("div", { class: "table-wrap" }, h("table", { class: "subs" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Servicio"), h("th", {}, "Importe"), h("th", {}, "Frecuencia"), h("th", {}, "Próximo cobro"))),
+        h("tbody", {}, ...subs.map((s) => {
+          const daysLeft = s.next ? Math.ceil((s.next - Date.now()) / 864e5) : null;
+          return h("tr", {},
+            h("td", {}, h("a", { href: gmailLink(s.lastId), target: "_blank", rel: "noopener" }, s.name)),
+            h("td", {}, s.money ? fmtMoney(s.money) : "?"),
+            h("td", {}, s.freq ? s.freq.name : "Sin datos"),
+            h("td", { class: daysLeft !== null && daysLeft <= 3 ? "soon" : "" },
+              s.next ? new Date(s.next).toLocaleDateString("es", { day: "numeric", month: "short" }) +
+                " (" + (daysLeft <= 0 ? "hoy" : daysLeft === 1 ? "mañana" : "en " + daysLeft + " días") + ")" : "?"));
+        })))),
+      h("p", { class: "small" }, "Calculado a partir de los recibos de tu correo del último año. Las fechas son estimaciones.")
+    );
+  }
+
+  function renderPromos() {
+    const promos = state.mails
+      .filter((m) => m.labels.has("CATEGORY_PROMOTIONS") || (m.cat === "noise" && m.bulk))
+      .map((m) => ({ m, score: promoScore(m) }))
+      .filter((p) => p.score > 0);
+    const min = Number($("promoMin").value);
+    $("promoMinLabel").textContent = min;
+    const top = promos.filter((p) => p.score >= min).sort((a, b) => b.score - a.score);
+    $("promos").replaceChildren(...(top.length ? top.map((p) =>
+      h("a", { class: "mail", href: gmailLink(p.m.id), target: "_blank", rel: "noopener" },
+        h("div", { class: "row1" },
+          h("span", { class: "from" }, h("span", { class: "score" }, p.score), senderName(p.m.from)),
+          h("span", { class: "date" }, fmtDate(p.m.date))),
+        h("div", { class: "subj" }, p.m.subject || "(sin asunto)"))
+    ) : [h("div", { class: "empty" }, "Ninguna promo llega a esa puntuación. Baja el mínimo.")]));
+
+    const byCompany = new Map();
+    promos.forEach((p) => {
+      const key = baseDomain(p.m.from);
+      const cur = byCompany.get(key) || { name: senderName(p.m.from), best: p, n: 0 };
+      cur.n++;
+      if (p.score > cur.best.score) cur.best = p;
+      byCompany.set(key, cur);
+    });
+    const companies = [...byCompany.values()].sort((a, b) => b.best.score - a.best.score).slice(0, 10);
+    $("companies").replaceChildren(...(companies.length ? companies.map((c) =>
+      h("a", { class: "mail", href: gmailLink(c.best.m.id), target: "_blank", rel: "noopener" },
+        h("div", { class: "row1" },
+          h("span", { class: "from" }, h("span", { class: "score" }, c.best.score), c.name),
+          h("span", { class: "date" }, c.n + (c.n === 1 ? " promo" : " promos"))),
+        h("div", { class: "snip" }, c.best.m.subject))
+    ) : [h("div", { class: "empty" }, "Sin promociones en este periodo.")]));
   }
 
   function renderAgenda() {
@@ -314,15 +499,23 @@
     const days = $("days").value;
     $("list").replaceChildren(h("div", { class: "loading" }, "Leyendo tu correo…"));
     $("agenda").replaceChildren(h("div", { class: "loading" }, "Leyendo tu agenda…"));
+    $("subs").replaceChildren(h("div", { class: "loading" }, "Buscando recibos…"));
     $("refresh").disabled = true;
     setBanner(state.demo ? "Estás viendo una demostración con datos inventados." : "");
     try {
       if (state.demo) {
         const d = demoData();
         state.mails = d.mails; state.events = d.events; state.email = "";
+        state.subs = detectSubscriptions(d.receipts); state.subsError = "";
       } else {
         const [mails, events] = await Promise.all([fetchMails(days), fetchEvents()]);
         state.mails = mails; state.events = events;
+        state.subsError = "";
+        // Los recibos son de todo el año, no dependen del periodo elegido: se leen una vez por sesión.
+        if (!state.subs) {
+          try { state.subs = detectSubscriptions(await fetchReceipts()); }
+          catch (e) { if (e.message === "expired") throw e; state.subsError = e.message; }
+        }
       }
       state.mails.forEach((m) => { m.cat = classify(m); });
       $("who").textContent = state.demo ? "Demostración" : state.email;
@@ -343,7 +536,7 @@
 
   function logout() {
     if (state.token && window.google) google.accounts.oauth2.revoke(state.token, () => {});
-    state.token = null; state.mails = []; state.events = []; state.email = ""; state.demo = false;
+    state.token = null; state.mails = []; state.events = []; state.subs = null; state.email = ""; state.demo = false;
     showWelcome();
     $("loginNote").textContent = "Te has desconectado. No queda ningún dato tuyo en esta web.";
   }
@@ -370,6 +563,8 @@
       mk("App de Citas <hello@appcitas.com>", "Tienes 3 nuevos likes", "Entra para ver quién eres.", 5, ["INBOX", "CATEGORY_SOCIAL"], { bulk: true }),
       mk("App de Citas <hello@appcitas.com>", "¡Alguien te ha escrito!", "Abre la app para leerlo.", 28, ["INBOX", "CATEGORY_SOCIAL"], { bulk: true }),
       mk("Apuestas Ya <promo@apuestasya.com>", "Bono de 50 € para ti", "Solo hoy, regístrate y llévate tu bono.", 12, ["INBOX", "CATEGORY_PROMOTIONS"], { bulk: true }),
+      mk("Cine Ya <promos@cineya.com>", "2x1 en entradas este jueves", "Trae a quien quieras: segunda entrada gratis.", 15, ["INBOX", "CATEGORY_PROMOTIONS"], { bulk: true }),
+      mk("Zapatos Top <news@zapatostop.com>", "Envío gratis y 20% de descuento", "Usa el cupón OTONO20 hasta el domingo.", 33, ["INBOX", "CATEGORY_PROMOTIONS"], { bulk: true }),
       mk("Revista Tech <news@revistatech.com>", "Lo mejor de la semana", "Los 10 artículos más leídos.", 60, ["INBOX", "CATEGORY_PROMOTIONS"], { bulk: true }),
     ];
     const day = (n, hour) => { const d = new Date(); d.setDate(d.getDate() + n); d.setHours(hour, 0, 0, 0); return d.toISOString(); };
@@ -381,7 +576,15 @@
       { title: "Cobro del gimnasio", start: iso(4), allDay: true },
       { title: "Cena de cumpleaños de Marta", start: day(5, 21), allDay: false },
     ];
-    return { mails, events };
+    const ago = (d) => now - d * 864e5;
+    const rc = (from, subject, snippet, daysAgo) => ({ id: "demo" + Math.random().toString(36).slice(2), from, subject, snippet, date: ago(daysAgo) });
+    const receipts = [];
+    [3, 33, 63, 93].forEach((d) => receipts.push(rc("Música Plus <recibos@musicaplus.com>", "Recibo de tu suscripción", "Importe: 10,99 € · Plan Individual", d)));
+    [12, 42, 72].forEach((d) => receipts.push(rc("Apple <no_reply@email.apple.com>", "Tu recibo de Apple", "iCloud+ 200 GB 2,99 €", d)));
+    [26, 56, 86].forEach((d) => receipts.push(rc("Gimnasio Centro <cobros@gimnasiocentro.es>", "Factura mensual", "Cuota mensual 34,90 €", d)));
+    [200].forEach((d) => receipts.push(rc("Nube Fotos <billing@nubefotos.com>", "Your subscription renewal", "Annual plan €29.99", d)));
+    receipts.push(rc("Vídeo Stream <info@videostream.com>", "Bienvenido a tu suscripción", "Tu primer cobro de 7,99 € será el día 1", 10));
+    return { mails, events, receipts };
   }
 
   /* ---------- Arranque ---------- */
@@ -394,5 +597,8 @@
   $("logout").addEventListener("click", logout);
   $("login").addEventListener("click", () => { if (tokenClient) tokenClient.requestAccessToken({ prompt: "" }); else if (CFG.GOOGLE_CLIENT_ID) $("loginNote").textContent = "Un momento, cargando Google… vuelve a pulsar en unos segundos."; });
   $("demo").addEventListener("click", () => { state.demo = true; showApp(); load(); });
+  const savedMin = storeGet("promoMin");
+  if (savedMin) $("promoMin").value = savedMin;
+  $("promoMin").addEventListener("input", () => { storeSet("promoMin", $("promoMin").value); renderPromos(); });
   initGoogle();
 })();

@@ -141,3 +141,22 @@ footer { margin-top: 30px; text-align: center; font-size: 13px; color: var(--mut
   .grid { grid-template-columns: 1fr; }
   .tiles { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* Suscripciones y promos */
+.panel.wide { margin: 16px 0; }
+.subtotal { margin: 0 0 10px; }
+.table-wrap { overflow-x: auto; }
+table.subs { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.subs th { text-align: left; color: var(--muted); font-weight: 600; font-size: 13px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+table.subs td { padding: 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+table.subs td:first-child { white-space: normal; }
+table.subs a { color: inherit; }
+table.subs td.soon { color: var(--reply); font-weight: 600; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.panel-head h3 { margin: 0; }
+.slider { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.slider input { width: 120px; accent-color: var(--accent); }
+.score { display: inline-block; min-width: 30px; text-align: center; font-size: 12px; font-weight: 700; padding: 1px 6px; border-radius: 999px; margin-right: 6px; color: var(--reply); background: var(--reply-bg); }
+@media (max-width: 600px) {
+  table.subs td { white-space: normal; }
+}
