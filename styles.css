@@ -160,3 +160,32 @@ table.subs td.soon { color: var(--reply); font-weight: 600; }
 @media (max-width: 600px) {
   table.subs td { white-space: normal; }
 }
+
+/* Mis suscripciones (como el panel) */
+.subs-head { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+.subs-head .small { max-width: 480px; margin: 0; }
+.stats { display: flex; gap: 28px; }
+.stat-l { font-size: 13px; color: var(--muted); }
+.stat-n { font-size: 30px; font-weight: 700; line-height: 1.15; }
+table.subs td { vertical-align: top; padding: 12px 8px; }
+table.subs td.svc { min-width: 220px; white-space: normal; }
+.svc-name { font-weight: 600; font-size: 15px; }
+.svc-note { color: var(--muted); font-size: 13px; white-space: normal; }
+.svc-actions { margin-top: 4px; display: flex; gap: 12px; }
+button.link { border: 0; background: none; padding: 0; color: var(--accent); font-size: 13px; }
+td.left { min-width: 170px; }
+.left-n { font-weight: 600; }
+.bar { height: 6px; background: var(--surface-2); border-radius: 99px; overflow: hidden; margin: 6px 0 4px; }
+.bar span { display: block; height: 100%; background: var(--reply); border-radius: 99px; }
+.subs-tools { display: flex; gap: 14px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+.sub-form { display: grid; gap: 8px; max-width: 420px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+.sub-form h4 { margin: 0 0 4px; }
+.sub-form label { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 8px; font-size: 14px; }
+.sub-form input { font: inherit; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); min-width: 0; width: 100%; }
+.inline { display: flex; gap: 8px; align-items: center; }
+.panel.wide h4 { margin: 16px 0 6px; font-size: 15px; }
+.trials { margin: 0; padding-left: 20px; }
+@media (max-width: 600px) {
+  .sub-form label { grid-template-columns: 1fr; }
+  table.subs td.svc { min-width: 180px; }
+}

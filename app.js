@@ -136,22 +136,55 @@
     return threads.map(toMail).filter(Boolean);
   }
 
-  const RECEIPT_Q = 'newer_than:400d -category:promotions (recibo OR receipt OR factura OR invoice OR "tu suscripción" OR "your subscription" OR suscripción OR subscription OR renovación OR renewal OR membership OR "pago recibido" OR "payment received" OR "cobro")';
-
-  async function fetchReceipts() {
+  // Correos de altas, cobros, bajas y pruebas gratis del último año (ver subs.js).
+  async function fetchSubscriptionMails() {
     const G = "https://gmail.googleapis.com/gmail/v1/users/me";
-    const res = await api(G + "/messages?maxResults=150&q=" + encodeURIComponent(RECEIPT_Q));
-    const ids = (res.messages || []).map((m) => m.id);
-    const msgs = await mapLimit(ids, CONCURRENCY, (id) =>
-      api(G + "/messages/" + id + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject")
-    );
-    return msgs.map((m) => {
-      const hdr = (name) => {
-        const x = ((m.payload && m.payload.headers) || []).find((y) => y.name.toLowerCase() === name.toLowerCase());
-        return x ? x.value : "";
-      };
-      return { id: m.id, from: hdr("From"), subject: hdr("Subject"), snippet: decodeEntities(m.snippet), date: Number(m.internalDate) };
+    const ids = [];
+    let page = "";
+    do {
+      const res = await api(G + "/messages?maxResults=100&q=" + encodeURIComponent(ZenSubs.QUERY) + (page ? "&pageToken=" + page : ""));
+      (res.messages || []).forEach((m) => ids.push(m.id));
+      page = res.nextPageToken;
+    } while (page && ids.length < 300);
+    const hdr = (m, name) => {
+      const x = ((m.payload && m.payload.headers) || []).find((y) => y.name.toLowerCase() === name.toLowerCase());
+      return x ? x.value : "";
+    };
+    const metas = await mapLimit(ids, CONCURRENCY, (id) =>
+      api(G + "/messages/" + id + "?format=metadata&metadataHeaders=From&metadataHeaders=Subject"));
+    const candidates = metas
+      .map((m) => ({ id: m.id, from: hdr(m, "From"), subject: hdr(m, "Subject"), snippet: decodeEntities(m.snippet), date: Number(m.internalDate) }))
+      .filter((m) => ZenSubs.isCandidate(m))
+      .slice(0, 120);
+    await mapLimit(candidates, CONCURRENCY, async (m) => {
+      const full = await api(G + "/messages/" + m.id + "?format=full");
+      m.body = bodyText(full.payload);
     });
+    return candidates;
+  }
+
+  function b64(data) {
+    const bin = atob((data || "").replace(/-/g, "+").replace(/_/g, "/"));
+    return new TextDecoder("utf-8").decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+  }
+
+  // Texto del correo: la parte en texto plano si la hay; si no, el HTML convertido a texto (sin ejecutar nada).
+  function bodyText(payload) {
+    const parts = [];
+    (function walk(p) {
+      if (!p) return;
+      if (p.parts) p.parts.forEach(walk);
+      else if (p.body && p.body.data) parts.push(p);
+    })(payload);
+    const plain = parts.find((p) => p.mimeType === "text/plain");
+    if (plain) return b64(plain.body.data);
+    const html = parts.find((p) => p.mimeType === "text/html");
+    if (!html) return "";
+    const doc = new DOMParser().parseFromString(b64(html.body.data), "text/html");
+    doc.querySelectorAll("script,style,head").forEach((el) => el.remove());
+    doc.querySelectorAll("br,p,div,tr,li,h1,h2,h3,h4,table").forEach((el) => el.after("\n"));
+    doc.querySelectorAll("td,th").forEach((el) => el.after(" "));
+    return doc.body ? doc.body.textContent : "";
   }
 
   function toMail(t) {
@@ -220,78 +253,15 @@
     return (m ? m[1] : from || "").toLowerCase().trim();
   }
 
-  /* ---------- Suscripciones (a partir de recibos) ---------- */
-
-  const MONEY = /(R\$|US\$|\$|€|£)\s?(\d{1,4}(?:[.,]\d{2}))|(\d{1,4}(?:[.,]\d{2}))\s?(€|EUR|USD|BRL|GBP)/i;
-  const SUB_WORDS = /(suscripci[oó]n|subscription|membres[ií]a|membership|renovaci[oó]n|renewal|plan mensual|monthly plan)/i;
-  const SHARED_BILLERS = /(apple\.com|google\.com|paypal\.|stripe\.com)$/i;
-
-  function parseMoney(text) {
-    const m = MONEY.exec(text || "");
-    if (!m) return null;
-    let cur = (m[1] || m[4] || "").toUpperCase();
-    cur = { "EUR": "€", "USD": "$", "US$": "$", "BRL": "R$", "GBP": "£" }[cur] || cur;
-    const value = parseFloat((m[2] || m[3]).replace(",", "."));
-    return value > 0 ? { value, cur } : null;
-  }
-
   function baseDomain(from) {
     const d = senderEmail(from).split("@")[1] || "";
     return d.split(".").slice(-2).join(".");
   }
 
-  function frequency(days) {
-    if (days >= 6 && days <= 8) return { name: "Semanal", days: 7, perMonth: 30 / 7 };
-    if (days >= 25 && days <= 35) return { name: "Mensual", days: Math.round(days), perMonth: 1 };
-    if (days >= 80 && days <= 100) return { name: "Trimestral", days: Math.round(days), perMonth: 1 / 3 };
-    if (days >= 340 && days <= 390) return { name: "Anual", days: 365, perMonth: 1 / 12 };
-    return null;
-  }
-
-  function detectSubscriptions(receipts) {
-    const groups = new Map();
-    receipts.forEach((r) => {
-      r.money = parseMoney(r.subject + " " + r.snippet);
-      const dom = baseDomain(r.from);
-      // Apple, Google o PayPal cobran muchos servicios distintos: los separamos por importe.
-      const key = SHARED_BILLERS.test(dom) ? dom + "|" + (r.money ? r.money.cur + r.money.value : "?") : dom;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(r);
-    });
-    const subs = [];
-    groups.forEach((list, key) => {
-      list.sort((a, b) => a.date - b.date);
-      const last = list[list.length - 1];
-      const priced = list.filter((r) => r.money);
-      const money = priced.length ? priced[priced.length - 1].money : null;
-      let freq = null;
-      if (list.length >= 2) {
-        const gaps = [];
-        for (let i = 1; i < list.length; i++) gaps.push((list[i].date - list[i - 1].date) / 864e5);
-        gaps.sort((a, b) => a - b);
-        freq = frequency(gaps[Math.floor(gaps.length / 2)]);
-      }
-      const isSub = list.some((r) => SUB_WORDS.test(r.subject + " " + r.snippet));
-      if (!freq && !isSub) return;
-      const old = Date.now() - last.date > (freq ? freq.days * 1.6 : 45) * 864e5;
-      if (old) return; // hace tiempo que no cobra: probablemente cancelada
-      let next = null;
-      if (freq) {
-        next = last.date + freq.days * 864e5;
-        while (next < Date.now() - 864e5) next += freq.days * 864e5;
-      }
-      const name = senderName(last.from);
-      subs.push({
-        name: SHARED_BILLERS.test(key.split("|")[0]) && money ? name + " (" + fmtMoney(money) + ")" : name,
-        money, freq, next, count: list.length, lastId: last.id,
-      });
-    });
-    return subs.sort((a, b) => (a.next || Infinity) - (b.next || Infinity));
-  }
-
+  const CODES = { "€": "€", "$": "USD", "R$": "BRL", "£": "GBP" };
   function fmtMoney(m) {
     const v = m.value.toLocaleString("es", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    return m.cur === "€" ? v + " €" : m.cur + " " + v;
+    return v + " " + (CODES[m.cur] || m.cur);
   }
 
   /* ---------- Promociones ---------- */
@@ -391,37 +361,160 @@
     renderPromos();
   }
 
+  /* ---------- Suscripciones: pantalla ---------- */
+
+  // Lo que el usuario oculta, corrige o añade a mano se guarda solo en este navegador.
+  function prefs() {
+    try { return JSON.parse(storeGet("subsPrefs") || "{}"); } catch (e) { return {}; }
+  }
+  function savePrefs(p) { storeSet("subsPrefs", JSON.stringify(p)); }
+
+  function allSubs() {
+    const p = prefs();
+    const hidden = p.hidden || [];
+    const edits = p.edits || {};
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const list = (state.subs || []).filter((s) => !hidden.includes(s.key)).map((s) => {
+      const e = edits[s.key];
+      return e ? Object.assign({}, s, { amount: { value: e.value, cur: e.cur } }) : s;
+    });
+    (p.manual || []).forEach((m) => {
+      const period = m.yearly ? { months: 12, label: "año" } : { months: 1, label: "mes" };
+      const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
+      let next = new Date(today.getFullYear(), today.getMonth(), Math.min(m.day, lastDay)).getTime();
+      if (next < today.getTime()) next = ZenSubs.addPeriod(next, period, 1);
+      const prev = ZenSubs.addPeriod(next, period, -1);
+      list.push({
+        key: "manual:" + m.id, manual: true, name: m.name, note: m.note || "Añadida a mano.",
+        amount: m.value ? { value: m.value, cur: m.cur } : null, period, next, estimated: true,
+        periodDays: Math.round((next - prev) / 864e5), daysLeft: Math.round((next - today.getTime()) / 864e5),
+      });
+    });
+    return list.sort((a, b) => a.next - b.next);
+  }
+
   function renderSubs() {
     if (state.subsError) {
       $("subs").replaceChildren(h("div", { class: "error" }, "No pude leer los recibos: " + state.subsError));
       return;
     }
-    const subs = state.subs || [];
-    if (!subs.length) {
-      $("subs").replaceChildren(h("div", { class: "empty" }, "No he encontrado recibos de suscripciones en tu correo."));
-      return;
-    }
-    const totals = {};
+    const subs = allSubs();
+    const p = prefs();
+    // El total va en la moneda más habitual (euros si hay alguna en euros); el resto se indica aparte.
+    const counts = {};
+    subs.forEach((s) => { if (s.amount) counts[s.amount.cur] = (counts[s.amount.cur] || 0) + 1; });
+    const main = counts["€"] ? "€" : Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || "€";
+    let total = 0;
+    const others = {};
     subs.forEach((s) => {
-      if (s.money && s.freq) totals[s.money.cur] = (totals[s.money.cur] || 0) + s.money.value * s.freq.perMonth;
+      if (!s.amount) return;
+      const perMonth = s.amount.value / s.period.months;
+      if (s.amount.cur === main) total += perMonth; else others[s.amount.cur] = (others[s.amount.cur] || 0) + perMonth;
     });
-    const totalText = Object.entries(totals).map(([cur, v]) => fmtMoney({ cur, value: v })).join(" + ");
+
+    const fmtDay = (t) => new Date(t).toLocaleDateString("es", { day: "numeric", month: "short", year: "numeric" });
+    const rows = subs.map((s) => {
+      const pct = s.periodDays ? Math.min(100, Math.round((s.daysLeft / s.periodDays) * 100)) : 0;
+      const otherCur = s.amount && s.amount.cur !== main;
+      const note = s.note + (otherCur ? " En " + (CODES[s.amount.cur] || s.amount.cur) + ": no suma al total en " + (CODES[main] || main) + "." : "");
+      return h("tr", {},
+        h("td", { class: "svc" },
+          h("div", { class: "svc-name" }, s.lastId ? h("a", { href: gmailLink(s.lastId), target: "_blank", rel: "noopener" }, s.name) : s.name),
+          h("div", { class: "svc-note" }, note),
+          h("div", { class: "svc-actions" },
+            h("button", { class: "link", onclick: () => editSub(s) }, "Editar importe"),
+            h("button", { class: "link", onclick: () => hideSub(s) }, s.manual ? "Quitar" : "No es mía"))),
+        h("td", { class: "amt" }, s.amount ? fmtMoney(s.amount) + " / " + s.period.label : "?"),
+        h("td", { class: "next" }, fmtDay(s.next) + (s.estimated ? " (estimada)" : "")),
+        h("td", { class: "left" },
+          h("div", { class: "left-n" }, s.daysLeft === 1 ? "1 día" : s.daysLeft + " días"),
+          h("div", { class: "bar" }, h("span", { style: "width:" + pct + "%" })),
+          h("div", { class: "svc-note" }, "de " + s.periodDays + " del periodo")));
+    });
+
+    const trials = (state.trials || []).map((t) => {
+      const days = Math.max(0, Math.round((t.end - Date.now()) / 864e5));
+      return h("li", {}, h("strong", {}, t.name), ": empieza a cobrar el " + fmtDay(t.end) + " (" + (days === 1 ? "queda 1 día" : "quedan " + days + " días") + ").");
+    });
+    const hiddenCount = (p.hidden || []).length;
+
     $("subs").replaceChildren(
-      totalText ? h("p", { class: "subtotal" }, "Gasto estimado al mes: ", h("strong", {}, totalText)) : null,
-      h("div", { class: "table-wrap" }, h("table", { class: "subs" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Servicio"), h("th", {}, "Importe"), h("th", {}, "Frecuencia"), h("th", {}, "Próximo cobro"))),
-        h("tbody", {}, ...subs.map((s) => {
-          const daysLeft = s.next ? Math.ceil((s.next - Date.now()) / 864e5) : null;
-          return h("tr", {},
-            h("td", {}, h("a", { href: gmailLink(s.lastId), target: "_blank", rel: "noopener" }, s.name)),
-            h("td", {}, s.money ? fmtMoney(s.money) : "?"),
-            h("td", {}, s.freq ? s.freq.name : "Sin datos"),
-            h("td", { class: daysLeft !== null && daysLeft <= 3 ? "soon" : "" },
-              s.next ? new Date(s.next).toLocaleDateString("es", { day: "numeric", month: "short" }) +
-                " (" + (daysLeft <= 0 ? "hoy" : daysLeft === 1 ? "mañana" : "en " + daysLeft + " días") + ")" : "?"));
-        })))),
-      h("p", { class: "small" }, "Calculado a partir de los recibos de tu correo del último año. Las fechas son estimaciones.")
+      h("div", { class: "subs-head" },
+        h("p", { class: "small" }, "Lo que pagas cada mes y cuántos días te quedan pagados hasta el próximo cobro. Debajo, las pruebas gratis y cuándo empiezan a cobrar."),
+        h("div", { class: "stats" },
+          h("div", {}, h("div", { class: "stat-l" }, "Gasto al mes"), h("div", { class: "stat-n" }, fmtMoney({ value: total, cur: main })),
+            Object.keys(others).length ? h("div", { class: "svc-note" }, "+ " + Object.entries(others).map(([c, v]) => fmtMoney({ value: v, cur: c })).join(" + ")) : null),
+          h("div", {}, h("div", { class: "stat-l" }, "Suscripciones activas"), h("div", { class: "stat-n" }, subs.length)))),
+      subs.length ? h("div", { class: "table-wrap" }, h("table", { class: "subs" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Servicio"), h("th", {}, "Importe"), h("th", {}, "Próximo cobro"), h("th", {}, "Días pagados que te quedan"))),
+        h("tbody", {}, ...rows))) : h("div", { class: "empty" }, "No he encontrado suscripciones activas en tu correo."),
+      h("div", { class: "subs-tools" },
+        h("button", { onclick: addSub }, "+ Añadir una a mano"),
+        hiddenCount ? h("button", { class: "link", onclick: () => { const q = prefs(); q.hidden = []; savePrefs(q); renderSubs(); } }, "Mostrar ocultas (" + hiddenCount + ")") : null),
+      h("div", { id: "subForm" }),
+      h("h4", {}, "Pruebas gratis"),
+      trials.length ? h("ul", { class: "trials" }, ...trials) : h("p", { class: "small" }, "No tienes ninguna prueba gratis activa ahora mismo. Cuando empieces una, aparecerá aquí con los días que te quedan antes del primer cobro."),
+      h("p", { class: "small" }, "Sale de tus recibos y avisos de cobro en Gmail del último año. Si una fecha pone «estimada», el servicio no avisa de la renovación y se calcula a partir del último cobro o del alta. Lo que ocultes, corrijas o añadas a mano se guarda solo en este navegador.")
     );
+  }
+
+  function hideSub(s) {
+    const p = prefs();
+    if (s.manual) p.manual = (p.manual || []).filter((m) => "manual:" + m.id !== s.key);
+    else p.hidden = [...new Set([...(p.hidden || []), s.key])];
+    savePrefs(p);
+    renderSubs();
+  }
+
+  function subForm(title, fields, onSave) {
+    const box = $("subForm");
+    const inputs = {};
+    const row = (label, el) => h("label", {}, h("span", {}, label), el);
+    const curSel = h("select", {}, ...["€", "R$", "$", "£"].map((c) => h("option", { value: c }, CODES[c] || c)));
+    curSel.value = fields.cur || "€";
+    inputs.cur = curSel;
+    const form = h("form", { class: "sub-form", onsubmit: (ev) => {
+      ev.preventDefault();
+      const value = parseFloat(String(inputs.value.value).replace(",", "."));
+      onSave({
+        name: inputs.name ? inputs.name.value.trim() : "", value: isNaN(value) ? 0 : value, cur: inputs.cur.value,
+        day: inputs.day ? Math.min(31, Math.max(1, parseInt(inputs.day.value, 10) || 1)) : 0,
+        yearly: inputs.yearly ? inputs.yearly.value === "y" : false, note: inputs.note ? inputs.note.value.trim() : "",
+      });
+      box.replaceChildren();
+    } },
+      h("h4", {}, title),
+      fields.name !== undefined ? row("Nombre", inputs.name = h("input", { required: "required", value: fields.name, placeholder: "Por ejemplo, alquiler" })) : null,
+      row("Importe", h("span", { class: "inline" }, inputs.value = h("input", { inputmode: "decimal", value: fields.value || "", placeholder: "0,00" }), curSel)),
+      fields.day !== undefined ? row("Día de cobro", inputs.day = h("input", { type: "number", min: "1", max: "31", value: fields.day || 1 })) : null,
+      fields.yearly !== undefined ? row("Frecuencia", inputs.yearly = h("select", {}, h("option", { value: "m" }, "Cada mes"), h("option", { value: "y" }, "Cada año"))) : null,
+      fields.note !== undefined ? row("Nota", inputs.note = h("input", { value: fields.note, placeholder: "Opcional" })) : null,
+      h("div", { class: "inline" }, h("button", { class: "primary", type: "submit" }, "Guardar"), h("button", { type: "button", onclick: () => box.replaceChildren() }, "Cancelar")));
+    box.replaceChildren(form);
+    form.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function editSub(s) {
+    subForm("Importe de " + s.name, { value: s.amount ? String(s.amount.value).replace(".", ",") : "", cur: s.amount ? s.amount.cur : "€" }, (v) => {
+      const p = prefs();
+      if (s.manual) {
+        const m = (p.manual || []).find((x) => "manual:" + x.id === s.key);
+        if (m) { m.value = v.value; m.cur = v.cur; }
+      } else {
+        p.edits = Object.assign({}, p.edits, { [s.key]: { value: v.value, cur: v.cur } });
+      }
+      savePrefs(p);
+      renderSubs();
+    });
+  }
+
+  function addSub() {
+    subForm("Añadir una suscripción a mano", { name: "", value: "", cur: "€", day: new Date().getDate(), yearly: false, note: "" }, (v) => {
+      const p = prefs();
+      p.manual = [...(p.manual || []), Object.assign({ id: Date.now().toString(36) }, v)];
+      savePrefs(p);
+      renderSubs();
+    });
   }
 
   function renderPromos() {
@@ -511,14 +604,14 @@
       if (state.demo) {
         const d = demoData();
         state.mails = d.mails; state.events = d.events; state.email = "";
-        state.subs = detectSubscriptions(d.receipts); state.subsError = "";
+        const r = ZenSubs.detect(d.receipts); state.subs = r.subs; state.trials = r.trials; state.subsError = "";
       } else {
         const [mails, events] = await Promise.all([fetchMails(days), fetchEvents()]);
         state.mails = mails; state.events = events;
         state.subsError = "";
         // Los recibos son de todo el año, no dependen del periodo elegido: se leen una vez por sesión.
         if (!state.subs) {
-          try { state.subs = detectSubscriptions(await fetchReceipts()); }
+          try { const r = ZenSubs.detect(await fetchSubscriptionMails()); state.subs = r.subs; state.trials = r.trials; }
           catch (e) { if (e.message === "expired") throw e; state.subsError = e.message; }
         }
       }
@@ -582,13 +675,17 @@
       { title: "Cena de cumpleaños de Marta", start: day(5, 21), allDay: false },
     ];
     const ago = (d) => now - d * 864e5;
-    const rc = (from, subject, snippet, daysAgo) => ({ id: "demo" + Math.random().toString(36).slice(2), from, subject, snippet, date: ago(daysAgo) });
-    const receipts = [];
-    [3, 33, 63, 93].forEach((d) => receipts.push(rc("Música Plus <recibos@musicaplus.com>", "Recibo de tu suscripción", "Importe: 10,99 € · Plan Individual", d)));
-    [12, 42, 72].forEach((d) => receipts.push(rc("Apple <no_reply@email.apple.com>", "Tu recibo de Apple", "iCloud+ 200 GB 2,99 €", d)));
-    [26, 56, 86].forEach((d) => receipts.push(rc("Gimnasio Centro <cobros@gimnasiocentro.es>", "Factura mensual", "Cuota mensual 34,90 €", d)));
-    [200].forEach((d) => receipts.push(rc("Nube Fotos <billing@nubefotos.com>", "Your subscription renewal", "Annual plan €29.99", d)));
-    receipts.push(rc("Vídeo Stream <info@videostream.com>", "Bienvenido a tu suscripción", "Tu primer cobro de 7,99 € será el día 1", 10));
+    const inDays = (d) => new Date(now + d * 864e5).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+    const rc = (from, subject, body, daysAgo) => ({ id: "demo" + Math.random().toString(36).slice(2), from, subject, snippet: body.slice(0, 160), body, date: ago(daysAgo) });
+    const receipts = [
+      rc("Apple <no_reply@email.apple.com>", "Your invoice from Apple.", "Invoice Apple Account: demo@ejemplo.com iCloud iCloud+ with 200 GB (Monthly) Renews " + inDays(9) + " 2,99 €", 21),
+      rc("Spotify <no-reply@spotify.com>", "Confirmación de tu pedido de \"Premium Individual\"", "¡Gracias por tu pedido! Aceptas que se te cobrará automáticamente la tarifa de 10,99 € cada mes hasta que la canceles.", 70),
+      rc("Gimnasio Centro <cobros@gimnasiocentro.es>", "Recibo de tu cuota mensual", "Cuota mensual de tu suscripción: importe 34,90 €", 26),
+      rc("Gimnasio Centro <cobros@gimnasiocentro.es>", "Recibo de tu cuota mensual", "Cuota mensual de tu suscripción: importe 34,90 €", 56),
+      rc("Nube Fotos <billing@nubefotos.com>", "Your subscription has been cancelled", "Your subscription has been cancelled and will not renew.", 15),
+      rc("Nube Fotos <billing@nubefotos.com>", "Your receipt", "Monthly subscription. Amount paid €4.99", 45),
+      rc("Vídeo Stream <info@videostream.com>", "Empieza tu prueba gratuita", "Tu prueba gratuita termina el " + inDays(6) + ". Primer cobro de 7,99 € al mes.", 24),
+    ];
     return { mails, events, receipts };
   }
 
