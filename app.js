@@ -63,7 +63,12 @@
       scope: SCOPES,
       callback: onToken,
       error_callback: (err) => {
-        $("loginNote").textContent = "No se completó la conexión (" + (err && err.type || "cancelada") + ").";
+        const type = err && err.type;
+        $("loginNote").textContent = type === "popup_failed_to_open"
+          ? "Tu navegador ha bloqueado la ventana de Google. Permite las ventanas emergentes para esta web y vuelve a pulsar."
+          : type === "popup_closed"
+            ? "Se cerró la ventana de Google antes de terminar. Vuelve a pulsar Conectar con Google."
+            : "No se completó la conexión (" + (type || "cancelada") + ").";
       },
     });
   }
